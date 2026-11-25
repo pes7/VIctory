@@ -51,7 +51,7 @@ static DIR: OnceLock<PathBuf> = OnceLock::new();
 /// others, in `dir/<SOURCE_HASH>`, and a run only ever writes its own;
 /// [`KEPT`] of the newest are kept.
 pub fn use_pipeline_cache(dir: PathBuf) {
-    let _ = DIR.set(keyed(&dir));
+    DIR.get_or_init(|| keyed(&dir));
 }
 
 /// Whether `dir` is a library directory this wrote: a name that is 16
@@ -67,7 +67,9 @@ fn is_translation(dir: &Path) -> bool {
                     .bytes()
                     .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
         });
-    ours && dir.is_dir() && dir.join(LIBRARY_FILE).is_file()
+    ours
+        && dir.symlink_metadata().is_ok_and(|m| m.is_dir())
+        && dir.join(LIBRARY_FILE).symlink_metadata().is_ok_and(|m| m.is_file())
 }
 
 /// How many translations keep a library: the one in use and the previous
@@ -95,9 +97,12 @@ fn keyed(dir: &Path) -> PathBuf {
         .collect();
     others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     for (_, older) in others.into_iter().skip(KEPT - 1) {
-        // A library and a list or two: gone with the translation that made
-        // them. Nothing this run reads is ever one of them.
-        let _ = std::fs::remove_dir_all(&older);
+        // This directory may hold other files. Remove only our artifacts.
+        if std::fs::remove_file(older.join(LIBRARY_FILE)).is_ok() {
+            let _ = std::fs::remove_file(older.join(EARLY_FILE));
+            let _ = std::fs::remove_file(older.join(PREBUILT_FILE));
+            let _ = std::fs::remove_dir(&older);
+        }
     }
     path
 }
@@ -502,6 +507,41 @@ pub(crate) fn note_used(key: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cache_pruning_preserves_files_it_does_not_own() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let active = root.join(victory_shader::SOURCE_HASH);
+        let old = [root.join("0000000000000001"), root.join("0000000000000002")];
+        let personal = [root.join("backup"), root.join("0000000000000003")];
+        for path in std::iter::once(&active).chain(&old).chain(&personal) {
+            let notes = path.join("notes");
+            std::fs::create_dir_all(&notes).unwrap();
+            std::fs::write(notes.join("keep.txt"), b"untouched").unwrap();
+        }
+        let artifacts = [LIBRARY_FILE, EARLY_FILE, PREBUILT_FILE];
+        for path in std::iter::once(&active).chain(&old) {
+            for artifact in artifacts {
+                std::fs::write(path.join(artifact), b"cache artifact").unwrap();
+            }
+        }
+
+        assert_eq!(keyed(root), active);
+        for path in std::iter::once(&active).chain(&old).chain(&personal) {
+            assert_eq!(std::fs::read(path.join("notes/keep.txt")).unwrap(), b"untouched");
+        }
+        for artifact in artifacts {
+            assert!(active.join(artifact).is_file());
+        }
+        let retained = old.iter().filter(|path| path.join(LIBRARY_FILE).is_file()).count();
+        assert_eq!(retained, 1, "retain one older cache");
+        for path in &old {
+            let kept = path.join(LIBRARY_FILE).is_file();
+            assert_eq!(path.join(EARLY_FILE).is_file(), kept);
+            assert_eq!(path.join(PREBUILT_FILE).is_file(), kept);
+        }
+    }
 
     #[test]
     fn names_change_with_what_goes_into_the_pipeline() {
