@@ -74,7 +74,7 @@ fn keyed(dir: &Path) -> PathBuf {
             Some((at, other))
         })
         .collect();
-    others.sort_by(|a, b| b.0.cmp(&a.0));
+    others.sort_by_key(|(at, _)| std::cmp::Reverse(*at));
     for (_, older) in others.into_iter().skip(KEPT - 1) {
         // A library and a list or two: gone with the translation that made
         // them. Nothing this run reads is ever one of them.
